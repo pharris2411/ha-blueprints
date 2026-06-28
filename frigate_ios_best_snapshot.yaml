@@ -1,26 +1,22 @@
 blueprint:
-  name: Frigate Person Alert (iOS, Fast Thumbnail + Upgrade to Best Snapshot)
+  name: Frigate Person Alert (iOS, via Frigate Integration Image Entity)
   description: >
-    iOS notification driven by Frigate's MQTT events (not the camera's onboard
-    detection). Two-phase image strategy:
+    iOS notification driven by Frigate's MQTT events, with the image sourced
+    from the Frigate HA integration's own `image.<camera>_<label>` entity —
+    NOT a manually configured MQTT camera. The Frigate integration already
+    creates one of these per camera/label automatically; it tracks "the latest
+    detected object" and is fed by the same continuously-updating best-frame
+    data Frigate publishes live, mid-event. No separate MQTT camera setup
+    needed, no HTTP snapshot timing/race issues, no waiting for an event to
+    end.
 
-    PHASE 1 (immediate): on Frigate's "new" tracked-object event, sends the
-    notification right away using Frigate's thumbnail endpoint
-    (/api/frigate/notifications/<id>/thumbnail.jpg), which is reliably available
-    even while the person is still standing in frame (e.g. waiting at the door).
+    Find the entity under Settings > Devices & Services > Frigate > Entities,
+    or just type "image" in the entity search — it'll be named something like
+    "Front Door Person" with entity_id image.front_door_person.
 
-    PHASE 2 (silent upgrade): on Frigate's "end" event for that SAME tracked
-    object, waits a couple seconds for Frigate to finish writing the snapshot
-    file, then re-sends a notification with the identical `tag` so iOS replaces
-    the original in place — this time using Frigate's full-resolution snapshot
-    endpoint (/api/events/<id>/snapshot.jpg), only reliably available once
-    tracking has ended. This is a fixed delay, not a true readiness check, so
-    on an unusually slow write the upgrade fetch could still fail occasionally —
-    in that case the original phase-1 thumbnail just remains as the image shown.
-
-    This avoids the "Snapshot not available" error you get from querying the
-    full snapshot endpoint while someone is still in frame, while still getting
-    you a fast notification and, when possible, a sharper final image.
+    NOTE: image entities are served via /api/image_proxy/ (not
+    /api/camera_proxy/, which is for `camera` domain entities) — this
+    blueprint uses the correct path automatically based on the entity domain.
 
     Includes buttons: Open URL (optional), Silence THIS (timer), Silence ALL
     (optional list + this automation). Includes presence filter, quiet hours,
@@ -32,8 +28,8 @@ blueprint:
       name: Frigate camera name
       description: >
         The camera name as configured in Frigate's config.yml (NOT the HA
-        camera entity_id) — e.g. "front_door". Find it in Frigate's UI or
-        config under cameras:.
+        camera entity_id) — e.g. "front_door". Used to filter the
+        frigate/events MQTT trigger for cooldown/presence/zone logic.
       selector:
         text:
 
@@ -53,15 +49,17 @@ blueprint:
         text:
           multiple: true
 
-    enable_upgrade_phase:
-      name: Upgrade to full-resolution snapshot when object leaves frame
+    snapshot_image_entity:
+      name: Frigate "latest object" image entity (image source)
       description: >
-        ON (recommended) = after the fast thumbnail notification, silently
-        re-send with the full-res snapshot once Frigate's tracked-object event
-        ends. OFF = thumbnail only, no second send.
-      default: true
+        The image.<camera>_<label> entity created automatically by the Frigate
+        HA integration — e.g. image.front_door_person. NOT your regular live
+        camera entity, and not something you need to create yourself.
       selector:
-        boolean:
+        entity:
+          filter:
+            domain:
+              - image
 
     extra_sensors:
       name: Additional event sensors (optional)
@@ -244,7 +242,7 @@ blueprint:
         boolean: {}
 
 mode: queued
-max: 20
+max: 10
 
 triggers:
   - id: frigate_new
@@ -277,7 +275,7 @@ variables:
   frigate_camera_var: !input frigate_camera
   frigate_label_var: !input frigate_label
   frigate_zones_var: !input frigate_zones
-  enable_upgrade_phase_var: !input enable_upgrade_phase
+  frigate_image_entity_var: !input snapshot_image_entity
 
   extra_sensors_list: !input extra_sensors
 
@@ -355,17 +353,15 @@ actions:
             target:
               entity_id: "{{ all_list }}"
 
-      # ---------- Frigate MQTT event: camera/label/zone match ----------
+      # ---------- Frigate "new" tracked object: camera/label/zone match ----------
       - conditions:
           - condition: trigger
             id: frigate_new
           - condition: template
             value_template: >-
               {{ trigger.payload_json['after']['camera'] == frigate_camera_var
-                 and trigger.payload_json['after']['label'] == frigate_label_var }}
-          - condition: template
-            value_template: >-
-              {{ trigger.payload_json['type'] in ['new', 'end'] }}
+                 and trigger.payload_json['after']['label'] == frigate_label_var
+                 and trigger.payload_json['type'] == 'new' }}
           - condition: template
             value_template: >-
               {% if frigate_zones_var | length == 0 %}
@@ -375,141 +371,79 @@ actions:
                     | default([]) | select('in', frigate_zones_var) | list | length) > 0 }}
               {% endif %}
         sequence:
+          - condition: template
+            value_template: >-
+              {{ cooldown_seconds_var == 0
+                 or not this.attributes.last_triggered
+                 or (now() - this.attributes.last_triggered).total_seconds() > cooldown_seconds_var }}
+
+          - condition: template
+            value_template: >-
+              {% if presence_filter_enabled_var %}
+                {{ (expand(presence_entities_list)
+                    | selectattr('state','eq','home')
+                    | list | length) == 0 }}
+              {% else %} true {% endif %}
+
+          - condition: template
+            value_template: >-
+              {{ (disable_hours_list | length == 0)
+                 or (now().hour not in disable_hours_list) }}
+
           - variables:
-              frigate_event_id: "{{ trigger.payload_json['after']['id'] }}"
-              event_type_now: "{{ trigger.payload_json['type'] }}"
               zone_text: >-
                 {{ (trigger.payload_json['after']['current_zones'] | default([]) | join(', ')) or 'frame' }}
-              shared_tag: "frigate-{{ frigate_event_id }}"
+              # Cache-bust so each notification fetches a fresh frame rather than a
+              # possibly-stale cached image at the same URL.
+              cache_bust: "{{ now().timestamp() | int }}"
+              # image.* entities (created by the Frigate integration) are served via
+              # /api/image_proxy/, NOT /api/camera_proxy/ (that path is for `camera`
+              # domain entities only) — confirmed against HA core's image component.
+              image_full_url: >-
+                {{ (base_url_input | trim).rstrip('/') ~ '/api/image_proxy/'
+                   ~ frigate_image_entity_var ~ '?token='
+                   ~ state_attr(frigate_image_entity_var, 'access_token')
+                   ~ '&t=' ~ cache_bust }}
+              title_final: "{{ custom_title_text | trim }}"
+              msg_default: "{{ (frigate_label_var | capitalize) ~ ' detected at ' ~ frigate_camera_var }}"
+              msg_final: >-
+                {% set base = custom_message_text | trim %}
+                {% if base == '' %}
+                  {{ msg_default }}
+                {% else %}
+                  {{ base
+                     | replace('{camera_name}', frigate_camera_var)
+                     | replace('{event}', frigate_label_var)
+                     | replace('{zone}', zone_text) }}
+                {% endif %}
+              url_on: "{{ enable_open_url_button_var and (open_url_text | trim) != '' }}"
 
-          - choose:
-              # ===== PHASE 1: "new" event -> fast thumbnail notification =====
-              - conditions:
-                  - condition: template
-                    value_template: "{{ event_type_now == 'new' }}"
-                sequence:
-                  # Cooldown (only gates the initial notify, not the silent upgrade)
-                  - condition: template
-                    value_template: >-
-                      {{ cooldown_seconds_var == 0
-                         or not this.attributes.last_triggered
-                         or (now() - this.attributes.last_triggered).total_seconds() > cooldown_seconds_var }}
-
-                  - condition: template
-                    value_template: >-
-                      {% if presence_filter_enabled_var %}
-                        {{ (expand(presence_entities_list)
-                            | selectattr('state','eq','home')
-                            | list | length) == 0 }}
-                      {% else %} true {% endif %}
-
-                  - condition: template
-                    value_template: >-
-                      {{ (disable_hours_list | length == 0)
-                         or (now().hour not in disable_hours_list) }}
-
-                  - variables:
-                      image_full_url: >-
-                        {{ (base_url_input | trim).rstrip('/')
-                           ~ '/api/frigate/notifications/' ~ frigate_event_id ~ '/thumbnail.jpg' }}
-                      title_final: "{{ custom_title_text | trim }}"
-                      msg_default: "{{ (frigate_label_var | capitalize) ~ ' detected at ' ~ frigate_camera_var }}"
-                      msg_final: >-
-                        {% set base = custom_message_text | trim %}
-                        {% if base == '' %}
-                          {{ msg_default }}
-                        {% else %}
-                          {{ base
-                             | replace('{camera_name}', frigate_camera_var)
-                             | replace('{event}', frigate_label_var)
-                             | replace('{zone}', zone_text) }}
-                        {% endif %}
-                      url_on: "{{ enable_open_url_button_var and (open_url_text | trim) != '' }}"
-
-                  - repeat:
-                      for_each: "{{ notify_ids_list }}"
-                      sequence:
-                        - variables:
-                            svc_name: "{{ 'notify.mobile_app_' ~ (device_attr(repeat.item,'name') | slugify) }}"
-                        - action: "{{ svc_name }}"
-                          data:
-                            title: "{{ title_final }}"
-                            message: "{{ msg_final }}"
-                            data:
-                              tag: "{{ shared_tag }}"
-                              attachment:
-                                url: "{{ image_full_url }}"
-                                content-type: jpeg
-                              url: "{{ open_url_text if url_on else None }}"
-                              push:
-                                sound:
-                                  name: "{{ ios_sound_name_var }}"
-                                  volume: "{{ 0 if ios_sound_name_var == 'none' else ios_sound_volume_float }}"
-                                  critical: "{{ 1 if ios_critical_var else 0 }}"
-                              entity_id: "{{ ios_live_view_entity if ios_live_view_entity|trim != '' else none }}"
-                              actions: >-
-                                {{
-                                  ([{'action': 'URI', 'title': open_url_title_text, 'uri': open_url_text}] if url_on else [])
-                                  + ([{'action': action_silence_one, 'title': 'Silence ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-sleep-outline'}] if show_silence_this_var else [])
-                                  + ([{'action': action_silence_all, 'title': 'Silence ALL ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-outline'}] if show_silence_all_var else [])
-                                }}
-
-              # ===== PHASE 2: "end" event -> silent upgrade to full snapshot =====
-              - conditions:
-                  - condition: template
-                    value_template: "{{ event_type_now == 'end' and enable_upgrade_phase_var }}"
-                sequence:
-                  # Small buffer for Frigate to finish writing the snapshot file to disk
-                  # right after tracking ends. Self-contained — no extra HA config needed —
-                  # but this is a fixed delay, not a real readiness check, so there's a small
-                  # residual chance the fetch still 404s on an unusually slow write.
-                  - delay:
-                      seconds: 2
-
-                  - variables:
-                      snapshot_full_url: >-
-                        {{ (base_url_input | trim).rstrip('/')
-                           ~ '/api/events/' ~ frigate_event_id ~ '/snapshot.jpg' }}
-                      title_final: "{{ custom_title_text | trim }}"
-                      msg_default: "{{ (frigate_label_var | capitalize) ~ ' detected at ' ~ frigate_camera_var }}"
-                      msg_final: >-
-                        {% set base = custom_message_text | trim %}
-                        {% if base == '' %}
-                          {{ msg_default }}
-                        {% else %}
-                          {{ base
-                             | replace('{camera_name}', frigate_camera_var)
-                             | replace('{event}', frigate_label_var)
-                             | replace('{zone}', zone_text) }}
-                        {% endif %}
-                      url_on: "{{ enable_open_url_button_var and (open_url_text | trim) != '' }}"
-
-                  - repeat:
-                      for_each: "{{ notify_ids_list }}"
-                      sequence:
-                        - variables:
-                            svc_name: "{{ 'notify.mobile_app_' ~ (device_attr(repeat.item,'name') | slugify) }}"
-                        - action: "{{ svc_name }}"
-                          data:
-                            title: "{{ title_final }}"
-                            message: "{{ msg_final }}"
-                            data:
-                              tag: "{{ shared_tag }}"
-                              push:
-                                sound:
-                                  name: "none"
-                              attachment:
-                                url: "{{ snapshot_full_url }}"
-                                content-type: jpeg
-                              url: "{{ open_url_text if url_on else None }}"
-                              entity_id: "{{ ios_live_view_entity if ios_live_view_entity|trim != '' else none }}"
-                              actions: >-
-                                {{
-                                  ([{'action': 'URI', 'title': open_url_title_text, 'uri': open_url_text}] if url_on else [])
-                                  + ([{'action': action_silence_one, 'title': 'Silence ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-sleep-outline'}] if show_silence_this_var else [])
-                                  + ([{'action': action_silence_all, 'title': 'Silence ALL ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-outline'}] if show_silence_all_var else [])
-                                }}
-            default: []
+          - repeat:
+              for_each: "{{ notify_ids_list }}"
+              sequence:
+                - variables:
+                    svc_name: "{{ 'notify.mobile_app_' ~ (device_attr(repeat.item,'name') | slugify) }}"
+                - action: "{{ svc_name }}"
+                  data:
+                    title: "{{ title_final }}"
+                    message: "{{ msg_final }}"
+                    data:
+                      attachment:
+                        url: "{{ image_full_url }}"
+                        content-type: jpeg
+                      url: "{{ open_url_text if url_on else None }}"
+                      push:
+                        sound:
+                          name: "{{ ios_sound_name_var }}"
+                          volume: "{{ 0 if ios_sound_name_var == 'none' else ios_sound_volume_float }}"
+                          critical: "{{ 1 if ios_critical_var else 0 }}"
+                      entity_id: "{{ ios_live_view_entity if ios_live_view_entity|trim != '' else none }}"
+                      actions: >-
+                        {{
+                          ([{'action': 'URI', 'title': open_url_title_text, 'uri': open_url_text}] if url_on else [])
+                          + ([{'action': action_silence_one, 'title': 'Silence ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-sleep-outline'}] if show_silence_this_var else [])
+                          + ([{'action': action_silence_all, 'title': 'Silence ALL ' ~ silence_minutes_var ~ 'm', 'icon': 'mdi:bell-outline'}] if show_silence_all_var else [])
+                        }}
 
       # ---------- Extra sensor path (e.g. doorbell), kept for parity ----------
       - conditions:
