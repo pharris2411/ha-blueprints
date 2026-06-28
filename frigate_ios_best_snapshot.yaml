@@ -1,22 +1,44 @@
 blueprint:
-  name: Frigate Person Alert (iOS, via Frigate Integration Image Entity)
+  name: Frigate Person Alert (iOS, via MQTT Camera Snapshot)
   description: >
     iOS notification driven by Frigate's MQTT events, with the image sourced
-    from the Frigate HA integration's own `image.<camera>_<label>` entity —
-    NOT a manually configured MQTT camera. The Frigate integration already
-    creates one of these per camera/label automatically; it tracks "the latest
-    detected object" and is fed by the same continuously-updating best-frame
-    data Frigate publishes live, mid-event. No separate MQTT camera setup
-    needed, no HTTP snapshot timing/race issues, no waiting for an event to
-    end.
+    from a manually configured MQTT Camera entity fed DIRECTLY by Frigate's
+    per-object snapshot topic (frigate/<camera>/<label>/snapshot) — bypassing
+    the Frigate HA integration's own `image.*` entities, which have a known,
+    currently unresolved bug causing stale/poor-quality frames (see
+    blakeblackshear/frigate-hass-integration issue #1011). Talking to Frigate's
+    MQTT data directly avoids that bug entirely.
 
-    Find the entity under Settings > Devices & Services > Frigate > Entities,
-    or just type "image" in the entity search — it'll be named something like
-    "Front Door Person" with entity_id image.front_door_person.
+    Frigate's snapshot topic publishes a fresh JPEG continuously, every time
+    Frigate finds a better frame for the currently tracked object — live,
+    mid-event, no waiting required. This also sidesteps the timing problems of
+    Frigate's HTTP snapshot API (which only finalizes once tracking ends).
 
-    NOTE: image entities are served via /api/image_proxy/ (not
-    /api/camera_proxy/, which is for `camera` domain entities) — this
-    blueprint uses the correct path automatically based on the entity domain.
+    REQUIRES one-time setup (not something a blueprint can create for you):
+
+    1) In Frigate's config.yml, under the camera in question:
+
+      cameras:
+        <frigate_camera_name>:
+          mqtt:
+            enabled: true       # already the default
+            crop: false         # full frame instead of a tight crop
+            bounding_box: false # no box drawn over the person
+            timestamp: false    # optional — set true if you want a time overlay
+            height: 480         # default is only 270 if unset; bump for clarity
+            quality: 85         # default is 70
+
+    2) In Home Assistant's configuration.yaml:
+
+      mqtt:
+        camera:
+          - name: "Front Door Person Snapshot"
+            unique_id: front_door_person_snapshot
+            topic: "frigate/<frigate_camera_name>/<label>/snapshot"
+
+    Restart/reload both, then point the "MQTT Camera entity" input below at
+    the camera entity created by that second config block (e.g.
+    camera.front_door_person_snapshot).
 
     Includes buttons: Open URL (optional), Silence THIS (timer), Silence ALL
     (optional list + this automation). Includes presence filter, quiet hours,
@@ -49,17 +71,18 @@ blueprint:
         text:
           multiple: true
 
-    snapshot_image_entity:
-      name: Frigate "latest object" image entity (image source)
+    mqtt_snapshot_camera_entity:
+      name: MQTT Camera entity (image source)
       description: >
-        The image.<camera>_<label> entity created automatically by the Frigate
-        HA integration — e.g. image.front_door_person. NOT your regular live
-        camera entity, and not something you need to create yourself.
+        The HA camera entity created by the "mqtt: camera:" block pointed at
+        Frigate's frigate/<camera>/<label>/snapshot topic — e.g.
+        camera.front_door_person_snapshot. NOT your regular live-view camera
+        entity, and NOT a Frigate-integration image.* entity.
       selector:
         entity:
           filter:
             domain:
-              - image
+              - camera
 
     extra_sensors:
       name: Additional event sensors (optional)
@@ -275,7 +298,7 @@ variables:
   frigate_camera_var: !input frigate_camera
   frigate_label_var: !input frigate_label
   frigate_zones_var: !input frigate_zones
-  frigate_image_entity_var: !input snapshot_image_entity
+  mqtt_camera_entity_var: !input mqtt_snapshot_camera_entity
 
   extra_sensors_list: !input extra_sensors
 
@@ -396,13 +419,13 @@ actions:
               # Cache-bust so each notification fetches a fresh frame rather than a
               # possibly-stale cached image at the same URL.
               cache_bust: "{{ now().timestamp() | int }}"
-              # image.* entities (created by the Frigate integration) are served via
-              # /api/image_proxy/, NOT /api/camera_proxy/ (that path is for `camera`
-              # domain entities only) — confirmed against HA core's image component.
+              # `camera` domain entities (which the MQTT camera platform creates) are
+              # served via /api/camera_proxy/, confirmed against HA core source
+              # (homeassistant/components/camera/__init__.py: ENTITY_IMAGE_URL).
               image_full_url: >-
-                {{ (base_url_input | trim).rstrip('/') ~ '/api/image_proxy/'
-                   ~ frigate_image_entity_var ~ '?token='
-                   ~ state_attr(frigate_image_entity_var, 'access_token')
+                {{ (base_url_input | trim).rstrip('/') ~ '/api/camera_proxy/'
+                   ~ mqtt_camera_entity_var ~ '?token='
+                   ~ state_attr(mqtt_camera_entity_var, 'access_token')
                    ~ '&t=' ~ cache_bust }}
               title_final: "{{ custom_title_text | trim }}"
               msg_default: "{{ (frigate_label_var | capitalize) ~ ' detected at ' ~ frigate_camera_var }}"
